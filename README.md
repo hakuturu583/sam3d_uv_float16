@@ -1,3 +1,9 @@
+## Customization
+
+- Start with `uv venv`, `uv sync`, `uv pip install -e .`. Everything united under python3.10-pytorch2.5.1-cuda12.1
+- Autocast to float16 but force float in Rendering ---- Memory saving, now we can run single object creation in GPU4090.
+
+
 # SAM 3D
 
 SAM 3D Objects is one part of SAM 3D, a pair of models for object and human mesh reconstruction.  If you’re looking for SAM 3D Body, [click here](https://github.com/facebookresearch/sam-3d-body).
