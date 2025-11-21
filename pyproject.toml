@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "sam3d_objects"
 version = "0.0.1"
-requires-python = ">=3.11,<3.12"
+requires-python = ">=3.10,<3.12"
 dependencies = [
   "MoGe @ git+https://github.com/microsoft/MoGe.git@a8c37341bc0325ca99b9d57981cc3bb2bd3e255b",
   "Werkzeug==3.0.6",
@@ -16,7 +16,7 @@ dependencies = [
   "av==12.0.0",
   "bitsandbytes==0.43.0",
   "black==24.3.0",
-  "bpy==4.3.0",
+  # "bpy==4.3.0",
   "colorama==0.4.6",
   "conda-pack==0.7.1",
   "crcmod==1.7",
@@ -85,17 +85,17 @@ dependencies = [
   "smplx==0.1.28",
   "spconv-cu121==2.3.8",
   "tensorboard==2.16.2",
-  "torch==2.8.0+cu129",
+  #"torch==2.8.0+cu129",
   "timm==0.9.16",
   "tomli==2.0.1",
-  "torchaudio==2.8.0+cu129",
+  #"torchaudio==2.8.0+cu129",
   "uri-template==1.3.0",
   "usort==1.0.8.post1",
   "wandb==0.20.0",
   "webcolors==1.13",
   "webdataset==0.2.86",
   "xatlas==0.0.9",
-  "xformers==0.0.33+5d4b92a5.d20251029",
+  #"xformers==0.0.33+5d4b92a5.d20251029",
   "findpydeps",
   "lovely_tensors",
   "pipdeptree",
@@ -105,7 +105,7 @@ dependencies = [
   "kaolin==0.18.0",
   "seaborn==0.13.2",
   "flash_attn==2.8.3",
-  "pytorch3d @ git+https://github.com/facebookresearch/pytorch3d.git@75ebeeaea0908c5527e7b1e305fbc7681382db47",
+  # "pytorch3d @ git+https://github.com/facebookresearch/pytorch3d.git@75ebeeaea0908c5527e7b1e305fbc7681382db47",
 ]
 
 [tool.hatch.build]
@@ -118,11 +118,11 @@ packages = ["sam3d_objects"]
 allow-direct-references = true
 
 [tool.uv]
-extra-index-url = [
-  "https://pypi.ngc.nvidia.com",
-  "https://download.pytorch.org/whl/cu129",
-]
-find-links = ["https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.8.0_cu129.html"]
+#extra-index-url = [
+#  "https://pypi.ngc.nvidia.com",
+#  "https://download.pytorch.org/whl/cu121",
+#]
+find-links = ["https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.5.1_cu121.html"]
 index-strategy = "unsafe-best-match"
 
 [tool.uv.extra-build-dependencies]

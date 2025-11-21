@@ -317,7 +317,7 @@ class FlexiCubes:
                                             index=edge_group_to_cube * 12 + edge_group).reshape(-1, 2, 1)
         ue_group = self._linear_interp(s_group * alpha_group, x_group)
 
-        beta_group = torch.gather(input=beta.reshape(-1), dim=0,
+        beta_group = torch.gather(input=beta.float().reshape(-1), dim=0,
                                     index=edge_group_to_cube * 12 + edge_group).reshape(-1, 1)
         beta_sum = beta_sum.index_add_(0, index=edge_group_to_vd, source=beta_group)
         vd = vd.index_add_(0, index=edge_group_to_vd, source=ue_group * beta_group) / beta_sum
