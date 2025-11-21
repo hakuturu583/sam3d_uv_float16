@@ -1,3 +1,2 @@
-# https://dl.fbaipublicfiles.com/pytorch3d/packaging/wheels/py310_cu121_pyt251/down
-pytorch3d #@ git+https://github.com/facebookresearch/pytorch3d.git@75ebeeaea0908c5527e7b1e305fbc7681382db47
+pytorch3d # https://dl.fbaipublicfiles.com/pytorch3d/packaging/wheels/py310_cu121_pyt251/down
 flash_attn==2.8.3
