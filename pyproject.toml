@@ -48,6 +48,7 @@ gpu = [
 # T4 dataset integration (sam3d_objects.integrations.t4, tools/t4_sam3d_align.py)
 t4 = [
   "t4-devkit @ git+https://github.com/tier4/t4-devkit@v0.8.0",
+  "opencv-python",
 ]
 
 [tool.hatch.build]

@@ -13,12 +13,12 @@ import pytest
 os.environ.setdefault("LIDRA_SKIP_INIT", "true")
 
 torch = pytest.importorskip("torch")
+roma = pytest.importorskip("roma")
 
 from sam3d_objects.integrations.t4.frames import VIEWER_AXES, quat_to_matrix, rotz
 from sam3d_objects.integrations.t4.gaussian_ops import (
-    _matrix_to_quaternion,
-    _quaternion_to_matrix,
-    quaternion_multiply,
+    _quaternion_multiply,
+    _similarity_scale,
     transform_splats,
 )
 
@@ -31,42 +31,53 @@ def random_splats(n: int = 256, seed: int = 0):
     return xyz, quat, scaling
 
 
+def rotation_of(quat_wxyz):
+    """`wxyz` quaternions to rotation matrices, via roma's `xyzw` API."""
+    return roma.unitquat_to_rotmat(roma.quat_wxyz_to_xyzw(quat_wxyz))
+
+
 def covariance(quat, scaling):
-    rot = _quaternion_to_matrix(quat)
+    rot = rotation_of(quat)
     return rot @ torch.diag_embed(scaling**2) @ rot.transpose(-1, -2)
 
 
-def test_quaternion_matrix_round_trip_matches_numpy():
+def test_numpy_quaternion_convention_matches_roma():
+    """`frames.quat_to_matrix` claims wxyz + column vectors; hold it to that."""
     _, quat, _ = random_splats(64)
-    matrices = _quaternion_to_matrix(quat)
+    reference = rotation_of(quat)
     for i in range(0, 64, 7):
-        assert np.allclose(matrices[i].numpy(), quat_to_matrix(quat[i].numpy()), atol=1e-6)
-    recovered = _matrix_to_quaternion(matrices)
-    # q and -q are the same rotation
-    assert torch.allclose(_quaternion_to_matrix(recovered), matrices, atol=1e-5)
+        assert quat_to_matrix(quat[i].numpy()) == pytest.approx(reference[i].numpy(), abs=1e-6)
 
 
-def test_quaternion_multiply_composes_rotations():
+def test_quaternion_multiply_composes_rotations_in_wxyz_order():
+    """Pins the wxyz <-> xyzw boundary: a flipped converter would show up here."""
     a = torch.nn.functional.normalize(torch.tensor([[0.3, 0.1, -0.4, 0.8]]), dim=-1)
     b = torch.nn.functional.normalize(torch.tensor([[-0.2, 0.7, 0.1, 0.5]]), dim=-1)
-    composed = _quaternion_to_matrix(quaternion_multiply(a, b))
-    assert torch.allclose(composed, _quaternion_to_matrix(a) @ _quaternion_to_matrix(b), atol=1e-6)
+    composed = rotation_of(_quaternion_multiply(a, b))
+    assert torch.allclose(composed, rotation_of(a) @ rotation_of(b), atol=1e-6)
 
 
 @pytest.mark.parametrize(
-    "linear",
+    ("linear", "expected_scale"),
     [
-        torch.eye(3) * 3.7,
-        torch.tensor(rotz(0.9), dtype=torch.float32) * 2.0,
-        torch.tensor(VIEWER_AXES["gltf"], dtype=torch.float32),
-        torch.diag(torch.tensor([1.4, 0.6, 2.2])),
-        torch.tensor([[0.9, 0.3, 0.0], [-0.2, 1.1, 0.4], [0.0, 0.1, 0.7]]),
+        (torch.eye(3) * 3.7, 3.7),
+        (torch.tensor(rotz(0.9), dtype=torch.float32) * 2.0, 2.0),
+        (torch.tensor(VIEWER_AXES["gltf"], dtype=torch.float32), 1.0),
+        (torch.diag(torch.tensor([1.4, 0.6, 2.2])), None),
+        (torch.tensor([[0.9, 0.3, 0.0], [-0.2, 1.1, 0.4], [0.0, 0.1, 0.7]]), None),
+        (torch.diag(torch.tensor([1.0, -1.0, 1.0])) * 2.0, None),  # mirror: no quaternion
     ],
 )
-def test_transform_preserves_the_gaussian_covariance(linear):
-    """`Sigma -> A Sigma A^T` must hold for similarities and general maps alike."""
+def test_transform_preserves_the_gaussian_covariance(linear, expected_scale):
+    """`Sigma -> A Sigma A^T` must hold on both the similarity and the SVD path."""
     xyz, quat, scaling = random_splats()
     translation = torch.tensor([1.0, -2.0, 0.5])
+
+    scale = _similarity_scale(np.asarray(linear, dtype=np.float64))
+    if expected_scale is None:
+        assert scale is None
+    else:
+        assert scale == pytest.approx(expected_scale, rel=1e-6)
 
     new_xyz, new_quat, new_scaling = transform_splats(xyz, quat, scaling, linear, translation)
 
@@ -74,6 +85,7 @@ def test_transform_preserves_the_gaussian_covariance(linear):
     expected = linear @ covariance(quat, scaling) @ linear.T
     assert torch.allclose(covariance(new_quat, new_scaling), expected, atol=1e-5)
     assert torch.all(new_scaling > 0)
+    assert torch.allclose(torch.linalg.norm(new_quat, dim=-1), torch.ones(len(new_quat)), atol=1e-5)
 
 
 def test_similarity_scales_the_splat_radii_uniformly():
@@ -81,16 +93,6 @@ def test_similarity_scales_the_splat_radii_uniformly():
     linear = torch.tensor(rotz(0.4), dtype=torch.float32) * 2.5
     _, _, new_scaling = transform_splats(xyz, quat, scaling, linear, torch.zeros(3))
     assert torch.allclose(new_scaling, scaling * 2.5, atol=1e-5)
-
-
-def test_mirroring_map_is_handled_by_the_general_path():
-    """A negative determinant has no quaternion; the covariance must still be right."""
-    xyz, quat, scaling = random_splats(64)
-    linear = torch.diag(torch.tensor([1.0, -1.0, 1.0])) * 2.0
-    _, new_quat, new_scaling = transform_splats(xyz, quat, scaling, linear, torch.zeros(3))
-    expected = linear @ covariance(quat, scaling) @ linear.T
-    assert torch.allclose(covariance(new_quat, new_scaling), expected, atol=1e-5)
-    assert torch.allclose(torch.linalg.norm(new_quat, dim=-1), torch.ones(64), atol=1e-5)
 
 
 @pytest.mark.parametrize("seed", [0, 1, 2])

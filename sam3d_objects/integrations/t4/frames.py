@@ -35,14 +35,12 @@ from typing import Iterator
 import numpy as np
 
 __all__ = [
+    "FRAME_CHAIN",
     "OPENCV_FROM_PYTORCH3D",
-    "PYTORCH3D_FROM_OPENCV",
     "VIEWER_AXES",
     "axis_aligned_rotations",
-    "heading_correction",
     "matrix_to_quat",
     "obj_to_box_pose",
-    "quat_multiply",
     "quat_to_matrix",
     "rotz",
     "sam3d_pose_to_rigid",
@@ -52,25 +50,37 @@ __all__ = [
 ]
 
 
-#: ``p_cam = OPENCV_FROM_PYTORCH3D @ p_p3d``. The matrix is its own inverse.
-OPENCV_FROM_PYTORCH3D = np.diag([-1.0, -1.0, 1.0])
+#: The frames a reconstruction can be expressed in, in parent order: each is the
+#: parent of the one before it. Walking a prefix of this list is what moves an
+#: alignment outwards -- see ``pipeline.align_output_to_box``.
+FRAME_CHAIN = ("box", "camera", "base_link", "map")
 
-#: ``p_p3d = PYTORCH3D_FROM_OPENCV @ p_cam``.
-PYTORCH3D_FROM_OPENCV = OPENCV_FROM_PYTORCH3D
 
-#: Extra axis swaps for third party viewers, applied to points already expressed
-#: in a T4-style frame (+X forward, +Y left, +Z up).
+def _frozen(array: np.ndarray) -> np.ndarray:
+    """Mark a module-level matrix read-only, so a caller cannot edit it in place."""
+    array.flags.writeable = False
+    return array
+
+
+#: ``p_cam = OPENCV_FROM_PYTORCH3D @ p_p3d``. The matrix is its own inverse, so
+#: the same constant converts back.
+OPENCV_FROM_PYTORCH3D = _frozen(np.diag([-1.0, -1.0, 1.0]))
+
+#: Axis swaps for third party viewers, applied to points already expressed in a
+#: T4-style frame (+X forward, +Y left, +Z up). "No conversion" is the absence of
+#: an entry, not an identity entry -- see ``pipeline.align_output_to_box``.
 #:
 #: ``gltf`` is the glTF/three.js convention (+X right, +Y up, -Z forward), which
 #: is what most Gaussian-splat web viewers assume.
 VIEWER_AXES = {
-    "none": np.eye(3),
-    "gltf": np.array(
-        [
-            [0.0, -1.0, 0.0],
-            [0.0, 0.0, 1.0],
-            [-1.0, 0.0, 0.0],
-        ]
+    "gltf": _frozen(
+        np.array(
+            [
+                [0.0, -1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [-1.0, 0.0, 0.0],
+            ]
+        )
     ),
 }
 
@@ -121,20 +131,6 @@ def matrix_to_quat(matrix) -> np.ndarray:
         )
     q /= np.linalg.norm(q)
     return q if q[0] >= 0.0 else -q
-
-
-def quat_multiply(a, b) -> np.ndarray:
-    """Hamilton product of two ``(w, x, y, z)`` quaternions."""
-    aw, ax, ay, az = np.asarray(a, dtype=np.float64).reshape(4)
-    bw, bx, by, bz = np.asarray(b, dtype=np.float64).reshape(4)
-    return np.array(
-        [
-            aw * bw - ax * bx - ay * by - az * bz,
-            aw * bx + ax * bw + ay * bz - az * by,
-            aw * by - ax * bz + ay * bw + az * bx,
-            aw * bz + ax * by - ay * bx + az * bw,
-        ]
-    )
 
 
 def rotz(angle: float) -> np.ndarray:
@@ -224,15 +220,25 @@ def obj_to_box_pose(
     return rot_box_obj, trans_box, scale
 
 
-def axis_aligned_rotations() -> Iterator[np.ndarray]:
-    """Yield the 24 proper rotations that map the coordinate axes onto themselves."""
+def _build_axis_rotations() -> np.ndarray:
+    """The 24 proper rotations that map the coordinate axes onto themselves."""
     eye = np.eye(3)
+    rotations = []
     for perm in ((0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)):
         for signs in np.ndindex(2, 2, 2):
             sign_vec = 1.0 - 2.0 * np.asarray(signs, dtype=np.float64)
             candidate = (eye[list(perm)] * sign_vec[:, None]).T
             if np.linalg.det(candidate) > 0.0:
-                yield candidate
+                rotations.append(candidate)
+    return _frozen(np.stack(rotations))
+
+
+AXIS_ROTATIONS = _build_axis_rotations()
+
+
+def axis_aligned_rotations() -> Iterator[np.ndarray]:
+    """Yield the 24 proper rotations that map the coordinate axes onto themselves."""
+    yield from AXIS_ROTATIONS
 
 
 def snap_to_axis_rotation(matrix):
@@ -247,13 +253,11 @@ def snap_to_axis_rotation(matrix):
         between the input and the snapped rotation.
     """
     rot = np.asarray(matrix, dtype=np.float64).reshape(3, 3)
-    best, best_trace = None, -np.inf
-    for candidate in axis_aligned_rotations():
-        trace = float(np.trace(candidate.T @ rot))
-        if trace > best_trace:
-            best, best_trace = candidate, trace
-    angle = float(np.arccos(np.clip((best_trace - 1.0) / 2.0, -1.0, 1.0)))
-    return best, angle
+    # Minimising the Frobenius distance to a rotation maximises trace(C^T @ R).
+    traces = np.einsum("kij,ij->k", AXIS_ROTATIONS, rot)
+    best = int(traces.argmax())
+    angle = float(np.arccos(np.clip((traces[best] - 1.0) / 2.0, -1.0, 1.0)))
+    return AXIS_ROTATIONS[best], angle
 
 
 def snap_yaw_only(matrix):
@@ -280,8 +284,3 @@ def snap_yaw_only(matrix):
     else:
         delta = -float(np.arctan2(forward[1], forward[0]))
     return rotz(delta) @ rot, float(delta)
-
-
-def heading_correction(matrix) -> float:
-    """Return, in radians, the yaw correction :func:`snap_yaw_only` would apply."""
-    return snap_yaw_only(matrix)[1]

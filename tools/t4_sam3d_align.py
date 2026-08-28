@@ -30,6 +30,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "notebook"))
 
+# Every option table is read from the library rather than retyped, so adding a
+# mode cannot leave the CLI rejecting it. `pipeline` (and its torch import) stays
+# deferred to main() so --help and --dry-run never load the model stack.
+from sam3d_objects.integrations.t4.align import ROTATION_MODES, SCALE_MODES, Z_ALIGN_MODES
+from sam3d_objects.integrations.t4.dataset import MASK_SOURCES
+from sam3d_objects.integrations.t4.frames import FRAME_CHAIN, VIEWER_AXES
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -62,24 +69,24 @@ def build_parser() -> argparse.ArgumentParser:
     selection.add_argument("--limit", type=int, default=None, help="max objects to reconstruct")
 
     mask = parser.add_argument_group("mask")
-    mask.add_argument("--mask-source", default="auto", choices=["auto", "ann", "hull"])
+    mask.add_argument("--mask-source", default="auto", choices=MASK_SOURCES)
     mask.add_argument("--mask-dilate", type=int, default=0, help="dilate the mask, in pixels")
 
     align = parser.add_argument_group("alignment")
     align.add_argument(
         "--rotation-mode",
         default="snap24",
-        choices=["snap24", "yaw", "none"],
+        choices=ROTATION_MODES,
         help="snap24: square the object with the box (default). "
         "yaw: fix heading only, keep predicted roll/pitch. none: keep SAM 3D's rotation",
     )
     align.add_argument(
         "--scale-mode",
         default="iso",
-        choices=["iso", "length", "width", "height", "axis", "none"],
+        choices=SCALE_MODES,
         help="which box dimension refits the metric scale (default: iso)",
     )
-    align.add_argument("--z-align", default="center", choices=["center", "bottom"])
+    align.add_argument("--z-align", default="center", choices=Z_ALIGN_MODES)
     align.add_argument("--keep-translation", action="store_true")
     align.add_argument(
         "--extra-yaw-deg",
@@ -89,8 +96,13 @@ def build_parser() -> argparse.ArgumentParser:
         "SAM 3D reads a symmetric vehicle back-to-front",
     )
     align.add_argument("--percentile", type=float, default=1.0, help="outlier trim in %%")
-    align.add_argument("--out-frame", default="box", choices=["box", "camera", "base_link", "map"])
-    align.add_argument("--viewer-axes", default="none", choices=["none", "gltf"])
+    align.add_argument("--out-frame", default="box", choices=FRAME_CHAIN)
+    align.add_argument(
+        "--viewer-axes",
+        default=None,
+        choices=sorted(VIEWER_AXES),
+        help="final axis swap for third party viewers; omit to keep the frame's own axes",
+    )
 
     model = parser.add_argument_group("model")
     model.add_argument("--config", default="checkpoints/hf/pipeline.yaml")
@@ -109,11 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
-    from sam3d_objects.integrations.t4.dataset import (
-        load_camera_frame,
-        load_t4,
-        select_boxes,
-    )
+    from sam3d_objects.integrations.t4.dataset import load_camera_frame, load_t4, select_boxes
 
     t4 = load_t4(args.data_root, revision=args.revision)
     frame = load_camera_frame(
@@ -135,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"{frame.channel}: {frame.image.shape[1]}x{frame.image.shape[0]}, {len(boxes)} object(s)")
+    print("{}: {}x{}, {} object(s)".format(frame.channel, *frame.size, len(boxes)))
 
     if args.dry_run:
         return _dry_run(t4, frame, boxes, args, out_dir)
@@ -181,10 +189,13 @@ def main(argv: list[str] | None = None) -> int:
             f"scale x{np.mean(report['scale_ratio_vs_sam3d']):.3f} vs SAM 3D "
             f"-> {out_dir / f'{stem}.ply'}"
         )
+        # Drop the splats before the next object is reconstructed, so peak VRAM
+        # never holds two full clouds plus the model.
+        del result
     return 0
 
 
-def _dry_run(t4, frame, boxes, args, out_dir: Path) -> int:
+def _dry_run(t4, frame, boxes, args, out_dir: Path) -> int:  # noqa: D401
     """Report the selection and dump mask previews, without touching the model."""
     from PIL import Image
 

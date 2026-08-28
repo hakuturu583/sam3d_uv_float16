@@ -21,20 +21,31 @@ from typing import Any
 
 import numpy as np
 
-from .frames import (
-    matrix_to_quat,
-    obj_to_box_pose,
-    rotz,
-    snap_to_axis_rotation,
-    snap_yaw_only,
-    yaw_of,
-)
+from .frames import obj_to_box_pose, rotz, snap_to_axis_rotation, snap_yaw_only, yaw_of
 
-__all__ = ["BoxAlignment", "align_to_box", "compose_alignment", "robust_extent"]
+__all__ = [
+    "ROTATION_MODES",
+    "check_choice",
+    "SCALE_MODES",
+    "Z_ALIGN_MODES",
+    "BoxAlignment",
+    "align_to_box",
+    "compose_alignment",
+    "robust_extent",
+]
 
 ROTATION_MODES = ("snap24", "yaw", "none")
-SCALE_MODES = ("iso", "length", "width", "height", "axis", "none")
+#: Modes that fit the scale from a single box dimension, and which axis of the
+#: box frame that dimension spans.
+_SCALE_AXIS = {"length": 0, "width": 1, "height": 2}
+SCALE_MODES = ("iso", *_SCALE_AXIS, "axis", "none")
 Z_ALIGN_MODES = ("center", "bottom")
+
+
+def check_choice(name: str, value: str, allowed) -> None:
+    """Raise a uniform ``ValueError`` when an option is outside its table."""
+    if value not in allowed:
+        raise ValueError(f"{name} must be one of {tuple(allowed)}, got {value!r}")
 
 
 @dataclass(frozen=True)
@@ -65,23 +76,6 @@ class BoxAlignment:
         scale_sq = float(gram[0, 0])
         return bool(np.allclose(gram, scale_sq * np.eye(3), rtol=1e-6, atol=1e-9))
 
-    @property
-    def scale(self) -> float:
-        """Uniform scale factor. Raises for anisotropic alignments."""
-        if not self.is_similarity:
-            raise ValueError("alignment is not a similarity; inspect `linear` instead")
-        return float(np.sqrt(np.linalg.det(self.linear) ** (2.0 / 3.0)))
-
-    @property
-    def rotation(self) -> np.ndarray:
-        """Rotation part. Raises for anisotropic alignments."""
-        return self.linear / self.scale
-
-    @property
-    def quaternion(self) -> np.ndarray:
-        """Rotation part as a ``(w, x, y, z)`` quaternion."""
-        return matrix_to_quat(self.rotation)
-
 
 def robust_extent(points, percentile: float = 1.0):
     """Return ``(lower, upper, extent)`` per axis, ignoring outlier splats.
@@ -100,8 +94,7 @@ def robust_extent(points, percentile: float = 1.0):
     if percentile <= 0.0:
         lower, upper = pts.min(axis=0), pts.max(axis=0)
     else:
-        lower = np.percentile(pts, percentile, axis=0)
-        upper = np.percentile(pts, 100.0 - percentile, axis=0)
+        lower, upper = np.percentile(pts, (percentile, 100.0 - percentile), axis=0)
     return lower, upper, np.maximum(upper - lower, 1e-9)
 
 
@@ -159,12 +152,9 @@ def align_to_box(
         A :class:`BoxAlignment` into the ``"box"`` frame. Use
         :func:`compose_alignment` to move it to camera / ``base_link`` / map.
     """
-    if rotation_mode not in ROTATION_MODES:
-        raise ValueError(f"rotation_mode must be one of {ROTATION_MODES}, got {rotation_mode!r}")
-    if scale_mode not in SCALE_MODES:
-        raise ValueError(f"scale_mode must be one of {SCALE_MODES}, got {scale_mode!r}")
-    if z_align not in Z_ALIGN_MODES:
-        raise ValueError(f"z_align must be one of {Z_ALIGN_MODES}, got {z_align!r}")
+    check_choice("rotation_mode", rotation_mode, ROTATION_MODES)
+    check_choice("scale_mode", scale_mode, SCALE_MODES)
+    check_choice("z_align", z_align, Z_ALIGN_MODES)
 
     rot_box_obj, trans_box, scale_sam3d = obj_to_box_pose(
         sam3d_rotation=sam3d_rotation,
@@ -199,18 +189,13 @@ def align_to_box(
     target = np.array([length, width, height])  # box frame axis order: X, Y, Z
     ratios = target / extent
 
-    if scale_mode == "iso":
-        scale = np.full(3, float(np.median(ratios)))
-    elif scale_mode == "length":
-        scale = np.full(3, float(ratios[0]))
-    elif scale_mode == "width":
-        scale = np.full(3, float(ratios[1]))
-    elif scale_mode == "height":
-        scale = np.full(3, float(ratios[2]))
-    elif scale_mode == "axis":
+    if scale_mode == "axis":
         scale = ratios.astype(np.float64)
-    else:  # "none"
+    elif scale_mode == "none":
         scale = np.full(3, scale_sam3d)
+    else:
+        ratio = np.median(ratios) if scale_mode == "iso" else ratios[_SCALE_AXIS[scale_mode]]
+        scale = np.full(3, float(ratio))
 
     linear = np.diag(scale) @ rotation
 
@@ -219,8 +204,7 @@ def align_to_box(
     if keep_translation:
         # SAM 3D's offset is in MoGe units; rescale it by the same factor the
         # shape was rescaled by so the two stay consistent.
-        offset = trans_box * float(np.mean(scale)) / max(scale_sam3d, 1e-12)
-        translation = offset
+        translation = trans_box * float(np.mean(scale)) / max(scale_sam3d, 1e-12)
     else:
         translation = -center
         if z_align == "bottom":
@@ -238,7 +222,6 @@ def align_to_box(
         "extra_yaw_deg": float(extra_yaw_deg),
         "measured_extent_obj": extent.tolist(),
         "target_size_xyz": target.tolist(),
-        "box_size_wlh": [float(width), float(length), float(height)],
         "sam3d_offset_in_box_m": trans_box.tolist(),
         "axis_map": _describe_axis_map(rotation),
     }
@@ -271,14 +254,14 @@ def compose_alignment(
 
 
 def _describe_axis_map(rotation) -> dict[str, str]:
-    """Report which canonical object axis ended up on each box axis."""
-    names = ("+X", "+Y", "+Z")
+    """Report which canonical object axis each box axis ends up carrying.
+
+    Row ``i`` of ``R`` is ``R.T @ e_i``, the object-frame direction that lands on
+    box axis ``i``.
+    """
     out = {}
-    for col, axis in enumerate(("forward(+X)", "left(+Y)", "up(+Z)")):
-        # Column `col` of R^T is the box-frame image of object axis `col`;
-        # we want the inverse question, so look along the rows.
-        row = np.asarray(rotation, dtype=np.float64)[col]
+    rows = np.asarray(rotation, dtype=np.float64)
+    for row, axis in zip(rows, ("forward(+X)", "left(+Y)", "up(+Z)")):
         idx = int(np.argmax(np.abs(row)))
-        sign = "+" if row[idx] >= 0 else "-"
-        out[axis] = f"{sign}{names[idx][1:]}_obj"
+        out[axis] = f"{'+' if row[idx] >= 0 else '-'}{'XYZ'[idx]}_obj"
     return out

@@ -9,15 +9,12 @@ from typing import Any
 
 import numpy as np
 
-from .align import BoxAlignment, align_to_box, compose_alignment
+from .align import BoxAlignment, align_to_box, check_choice, compose_alignment
 from .dataset import CameraFrame, box_mask
-from .frames import VIEWER_AXES
+from .frames import FRAME_CHAIN, VIEWER_AXES
 from .gaussian_ops import opaque_positions, transform_gaussian
 
-__all__ = ["ObjectResult", "OUT_FRAMES", "align_output_to_box", "reconstruct_box"]
-
-#: Frames a reconstruction can be exported into.
-OUT_FRAMES = ("box", "camera", "base_link", "map")
+__all__ = ["ObjectResult", "align_output_to_box", "reconstruct_box"]
 
 
 @dataclass
@@ -26,9 +23,13 @@ class ObjectResult:
 
     instance_token: str
     category: str
-    frame: str
     alignment: BoxAlignment
     gaussian: Any
+
+    @property
+    def frame(self) -> str:
+        """Frame the splats are expressed in."""
+        return self.alignment.frame
 
     def save_ply(self, path) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -53,7 +54,7 @@ def align_output_to_box(
     box,
     *,
     out_frame: str = "box",
-    viewer_axes: str = "none",
+    viewer_axes: str | None = None,
     **align_kwargs,
 ) -> BoxAlignment:
     """Solve the alignment for one SAM 3D ``output`` and its T4 box.
@@ -64,17 +65,17 @@ def align_output_to_box(
         frame: The :class:`~sam3d_objects.integrations.t4.dataset.CameraFrame`
             the image came from.
         box: The ``Box3D`` (camera frame) the object was masked from.
-        out_frame: One of :data:`OUT_FRAMES`.
+        out_frame: One of :data:`~sam3d_objects.integrations.t4.frames.FRAME_CHAIN`.
         viewer_axes: Key into
             :data:`~sam3d_objects.integrations.t4.frames.VIEWER_AXES`, applied
-            last. ``"gltf"`` produces Y-up splats for web viewers.
+            last. ``"gltf"`` produces Y-up splats for web viewers; ``None``
+            leaves the frame's own axes alone.
         **align_kwargs: Forwarded to
             :func:`~sam3d_objects.integrations.t4.align.align_to_box`.
     """
-    if out_frame not in OUT_FRAMES:
-        raise ValueError(f"out_frame must be one of {OUT_FRAMES}, got {out_frame!r}")
-    if viewer_axes not in VIEWER_AXES:
-        raise ValueError(f"viewer_axes must be one of {sorted(VIEWER_AXES)}")
+    check_choice("out_frame", out_frame, FRAME_CHAIN)
+    if viewer_axes is not None:
+        check_choice("viewer_axes", viewer_axes, VIEWER_AXES)
 
     gaussian = output["gs"]
     obj_points = opaque_positions(gaussian).detach().cpu().float().numpy()
@@ -91,21 +92,17 @@ def align_output_to_box(
         **align_kwargs,
     )
 
-    if out_frame != "box":
-        alignment = compose_alignment(
-            alignment,
-            box.rotation.rotation_matrix,
-            np.asarray(box.position, dtype=np.float64),
-            "camera",
-        )
-    if out_frame in ("base_link", "map"):
-        alignment = compose_alignment(
-            alignment, frame.rot_ego_cam, frame.trans_ego_cam, "base_link"
-        )
-    if out_frame == "map":
-        alignment = compose_alignment(alignment, frame.rot_map_ego, frame.trans_map_ego, "map")
+    # The frames form one linear chain, so the hops to walk are exactly the
+    # prefix of FRAME_CHAIN up to the one asked for.
+    hops = (
+        ("camera", box.rotation.rotation_matrix, np.asarray(box.position, dtype=np.float64)),
+        ("base_link", frame.rot_ego_cam, frame.trans_ego_cam),
+        ("map", frame.rot_map_ego, frame.trans_map_ego),
+    )
+    for name, hop_rotation, hop_translation in hops[: FRAME_CHAIN.index(out_frame)]:
+        alignment = compose_alignment(alignment, hop_rotation, hop_translation, name)
 
-    if viewer_axes != "none":
+    if viewer_axes is not None:
         alignment = compose_alignment(
             alignment, VIEWER_AXES[viewer_axes], np.zeros(3), f"{alignment.frame}+{viewer_axes}"
         )
@@ -122,7 +119,7 @@ def reconstruct_box(
     mask_source: str = "auto",
     mask_dilate: int = 0,
     out_frame: str = "box",
-    viewer_axes: str = "none",
+    viewer_axes: str | None = None,
     **align_kwargs,
 ) -> ObjectResult | None:
     """Reconstruct one annotated object and align it to its box.
@@ -135,7 +132,8 @@ def reconstruct_box(
         seed: Diffusion seed.
         mask_source: See :func:`~sam3d_objects.integrations.t4.dataset.box_mask`.
         mask_dilate: Mask dilation in pixels.
-        out_frame: Export frame, one of :data:`OUT_FRAMES`.
+        out_frame: Export frame, one of
+            :data:`~sam3d_objects.integrations.t4.frames.FRAME_CHAIN`.
         viewer_axes: Optional final axis swap for third party viewers.
         **align_kwargs: Forwarded to
             :func:`~sam3d_objects.integrations.t4.align.align_to_box`.
@@ -160,7 +158,6 @@ def reconstruct_box(
     return ObjectResult(
         instance_token=box.uuid or "",
         category=box.semantic_label.name,
-        frame=alignment.frame,
         alignment=alignment,
         gaussian=gaussian,
     )
@@ -175,11 +172,11 @@ def _to_numpy(value) -> np.ndarray:
 def _layout_pose(output: dict):
     """Pull the decoded layout out of a SAM 3D output, checking it *is* decoded.
 
-    When the pipeline is configured with the ``"default"`` pose decoder the
-    layout head's raw activations stay in the output dict under the same key
-    names, so a silent misalignment is easy to walk into. The decoded scale is
-    an exponential and therefore strictly positive; the raw one is a log and is
-    routinely negative.
+    When the pipeline is configured with the ``"default"`` pose decoder (see
+    ``InferencePipeline.init_pose_decoder``) the layout head's raw activations
+    stay in the output dict under the same key names, so a silent misalignment is
+    easy to walk into. The decoded scale is an exponential and therefore strictly
+    positive; the raw one is a log and is routinely negative.
     """
     missing = [key for key in ("rotation", "translation", "scale") if key not in output]
     if missing:

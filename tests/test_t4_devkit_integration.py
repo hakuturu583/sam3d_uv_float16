@@ -29,7 +29,6 @@ from sam3d_objects.integrations.t4.frames import OPENCV_FROM_PYTORCH3D, matrix_t
 from .test_t4_alignment import (
     BOX_SIZE_WLH,
     CANONICAL_TO_BOX,
-    TRUE_SCALE,
     box_pose_in_camera,
     canonical_car,
     fake_sam3d_output,
@@ -234,4 +233,3 @@ def test_forgetting_the_camera_flip_turns_the_car_upside_down():
     assert correct == pytest.approx(CANONICAL_TO_BOX, abs=1e-9)
     assert correct @ np.array([0.0, 0.0, 1.0]) == pytest.approx([0.0, 0.0, 1.0], abs=1e-9)
     assert naive @ np.array([0.0, 0.0, 1.0]) == pytest.approx([0.0, 0.0, -1.0], abs=1e-9)
-    assert TRUE_SCALE > 0  # the shared fixture is in use

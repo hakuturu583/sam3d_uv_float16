@@ -91,8 +91,8 @@ a similarity rotates the quaternions and scales the radii, and an anisotropic
 * `map` — world coordinates via `ego_pose`.
 
 `--viewer-axes gltf` adds a final swap to the Y-up / −Z-forward convention most
-web splat viewers assume. Without it a `base_link` or `box` export is Z-up and
-will appear lying on its side.
+web splat viewers assume. Omit the flag to keep the frame's own axes; without it
+a `base_link` or `box` export is Z-up and will appear lying on its side.
 
 ## Masks
 
@@ -118,5 +118,9 @@ result.save_ply("car.ply")
 print(result.alignment.report["yaw_correction_deg"])
 ```
 
-The coordinate math is `numpy` only and has no CUDA, checkpoint or dataset
-dependency — see `tests/test_t4_alignment.py`.
+`frames.py` and `align.py` are `numpy` only, with no CUDA, checkpoint or dataset
+dependency, so the coordinate math can be exercised directly — see
+`tests/test_t4_alignment.py`. Every option table (`ROTATION_MODES`,
+`SCALE_MODES`, `Z_ALIGN_MODES`, `FRAME_CHAIN`, `VIEWER_AXES`, `MASK_SOURCES`) is
+exported from the module that implements it, and the CLI reads its `choices`
+from those rather than restating them.

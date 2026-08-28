@@ -219,9 +219,14 @@ def test_robust_extent_ignores_outliers():
     assert extent[0] == pytest.approx(2.0, abs=0.05)
 
 
-def align_perturbed(**kwargs):
+def align_perturbed(
+    *, box_size=BOX_SIZE_WLH, yaw_error=0.0, tilt=0.0, scale_error=1.0, **align_kwargs
+):
+    """Align a deliberately-wrong SAM 3D output onto a box, and hand back both."""
     rot_cam_box, pos_cam_box = box_pose_in_camera()
-    quat, trans, scale = fake_sam3d_output(rot_cam_box, pos_cam_box, **kwargs)
+    quat, trans, scale = fake_sam3d_output(
+        rot_cam_box, pos_cam_box, yaw_error=yaw_error, tilt=tilt, scale_error=scale_error
+    )
     alignment = align_to_box(
         canonical_car(),
         sam3d_rotation=quat,
@@ -229,8 +234,9 @@ def align_perturbed(**kwargs):
         sam3d_scale=scale,
         box_rotation=rot_cam_box,
         box_position=pos_cam_box,
-        box_size=BOX_SIZE_WLH,
+        box_size=box_size,
         percentile=0.0,
+        **align_kwargs,
     )
     return alignment, rot_cam_box, pos_cam_box
 
@@ -274,41 +280,18 @@ def test_box_size_is_width_length_height_not_xyz():
 
 
 def test_bottom_alignment_seats_the_object_on_the_box_floor():
-    rot_cam_box, pos_cam_box = box_pose_in_camera()
-    quat, trans, scale = fake_sam3d_output(rot_cam_box, pos_cam_box)
-    alignment = align_to_box(
-        canonical_car(),
-        sam3d_rotation=quat,
-        sam3d_translation=trans,
-        sam3d_scale=scale,
-        box_rotation=rot_cam_box,
-        box_position=pos_cam_box,
-        box_size=BOX_SIZE_WLH,
-        z_align="bottom",
-        percentile=0.0,
-    )
+    alignment, _, _ = align_perturbed(z_align="bottom")
     aligned = canonical_car() @ alignment.linear.T + alignment.translation
     assert aligned[:, 2].min() == pytest.approx(-BOX_SIZE_WLH[2] / 2, abs=1e-9)
 
 
 def test_axis_scale_mode_fills_a_box_of_a_different_aspect_ratio():
     """`axis` trades shape fidelity for an exact fill; `iso` would leave a gap."""
-    rot_cam_box, pos_cam_box = box_pose_in_camera()
-    quat, trans, scale = fake_sam3d_output(rot_cam_box, pos_cam_box, scale_error=0.7)
     # A box that is wider and flatter than the reconstruction.
     stretched = (BOX_SIZE_WLH[0] * 1.3, BOX_SIZE_WLH[1], BOX_SIZE_WLH[2] * 0.8)
-
-    kwargs = dict(
-        sam3d_rotation=quat,
-        sam3d_translation=trans,
-        sam3d_scale=scale,
-        box_rotation=rot_cam_box,
-        box_position=pos_cam_box,
-        box_size=stretched,
-        percentile=0.0,
-    )
-    anisotropic = align_to_box(canonical_car(), scale_mode="axis", **kwargs)
-    isotropic = align_to_box(canonical_car(), scale_mode="iso", **kwargs)
+    kwargs = dict(box_size=stretched, scale_error=0.7)
+    anisotropic, _, _ = align_perturbed(scale_mode="axis", **kwargs)
+    isotropic, _, _ = align_perturbed(scale_mode="iso", **kwargs)
 
     width, length, height = stretched
     aligned = canonical_car() @ anisotropic.linear.T + anisotropic.translation
@@ -338,19 +321,7 @@ def test_composing_to_the_camera_frame_lands_inside_the_box():
 
 
 def test_rotation_mode_none_keeps_the_predicted_error():
-    rot_cam_box, pos_cam_box = box_pose_in_camera()
-    quat, trans, scale = fake_sam3d_output(rot_cam_box, pos_cam_box, yaw_error=np.deg2rad(10.0))
-    alignment = align_to_box(
-        canonical_car(),
-        sam3d_rotation=quat,
-        sam3d_translation=trans,
-        sam3d_scale=scale,
-        box_rotation=rot_cam_box,
-        box_position=pos_cam_box,
-        box_size=BOX_SIZE_WLH,
-        rotation_mode="none",
-        percentile=0.0,
-    )
+    alignment, _, _ = align_perturbed(yaw_error=np.deg2rad(10.0), rotation_mode="none")
     forward = alignment.linear @ np.array([0.0, 1.0, 0.0])
     forward /= np.linalg.norm(forward)
     assert np.degrees(np.arctan2(forward[1], forward[0])) == pytest.approx(10.0, abs=1e-6)
@@ -363,37 +334,19 @@ def test_gltf_viewer_axes_put_forward_on_minus_z():
     assert np.allclose(gltf @ np.array([0.0, 0.0, 1.0]), [0.0, 1.0, 0.0])  # up -> +Y
 
 
-def test_invalid_modes_are_rejected():
-    rot_cam_box, pos_cam_box = box_pose_in_camera()
-    quat, trans, scale = fake_sam3d_output(rot_cam_box, pos_cam_box)
-    with pytest.raises(ValueError):
-        align_to_box(
-            canonical_car(),
-            sam3d_rotation=quat,
-            sam3d_translation=trans,
-            sam3d_scale=scale,
-            box_rotation=rot_cam_box,
-            box_position=pos_cam_box,
-            box_size=BOX_SIZE_WLH,
-            rotation_mode="nope",
-        )
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [("rotation_mode", "nope"), ("scale_mode", "nope"), ("z_align", "nope")],
+)
+def test_invalid_modes_are_rejected(option, value):
+    with pytest.raises(ValueError, match=option):
+        align_perturbed(**{option: value})
 
 
 def test_extra_yaw_turns_a_back_to_front_car_around():
     """SAM 3D sometimes reads a symmetric vehicle backwards; 180 fixes it."""
-    rot_cam_box, pos_cam_box = box_pose_in_camera()
-    quat, trans, scale = fake_sam3d_output(rot_cam_box, pos_cam_box)
-    kwargs = dict(
-        sam3d_rotation=quat,
-        sam3d_translation=trans,
-        sam3d_scale=scale,
-        box_rotation=rot_cam_box,
-        box_position=pos_cam_box,
-        box_size=BOX_SIZE_WLH,
-        percentile=0.0,
-    )
-    straight = align_to_box(canonical_car(), **kwargs)
-    flipped = align_to_box(canonical_car(), extra_yaw_deg=180.0, **kwargs)
+    straight, _, _ = align_perturbed()
+    flipped, _, _ = align_perturbed(extra_yaw_deg=180.0)
 
     forward = np.array([0.0, 1.0, 0.0])
     assert straight.linear @ forward == pytest.approx(-(flipped.linear @ forward), abs=1e-9)

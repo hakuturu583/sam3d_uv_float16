@@ -10,10 +10,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Sequence
 
+import cv2
 import numpy as np
 from PIL import Image
 
 __all__ = [
+    "MASK_SOURCES",
     "CameraFrame",
     "box_mask",
     "load_t4",
@@ -22,17 +24,14 @@ __all__ = [
     "select_boxes",
 ]
 
+#: Where :func:`box_mask` may take an object's mask from.
+MASK_SOURCES = ("auto", "ann", "hull")
+
 
 def load_t4(data_root, revision: str | None = None, verbose: bool = True):
-    """Open a T4 dataset directory.
+    """Open a T4 dataset directory."""
+    from t4_devkit import T4Devkit
 
-    Uses ``T4Devkit`` (v0.8.0) and falls back to the deprecated ``Tier4`` alias
-    for older releases.
-    """
-    try:
-        from t4_devkit import T4Devkit
-    except ImportError:  # t4-devkit < 0.8
-        from t4_devkit import Tier4 as T4Devkit  # type: ignore[attr-defined]
     return T4Devkit(data_root, revision=revision, verbose=verbose)
 
 
@@ -180,30 +179,19 @@ def project_points(points, intrinsic, distortion=None) -> np.ndarray | None:
     if pts.shape[0] == 0:
         return None
 
-    normalized = pts[:, :2] / pts[:, 2:3]
-    if distortion is not None and np.any(distortion):
-        try:
-            import cv2
-
-            uv, _ = cv2.projectPoints(
-                pts.reshape(-1, 1, 3),
-                np.zeros(3),
-                np.zeros(3),
-                np.asarray(intrinsic, dtype=np.float64),
-                np.asarray(distortion, dtype=np.float64).reshape(1, -1),
-            )
-            return uv.reshape(-1, 2)
-        except ImportError:
-            pass  # fall through to the pinhole projection
-
     k = np.asarray(intrinsic, dtype=np.float64)
-    return np.stack(
-        (
-            k[0, 0] * normalized[:, 0] + k[0, 1] * normalized[:, 1] + k[0, 2],
-            k[1, 1] * normalized[:, 1] + k[1, 2],
-        ),
-        axis=1,
-    )
+    if distortion is not None and np.any(distortion):
+        uv, _ = cv2.projectPoints(
+            pts.reshape(-1, 1, 3),
+            np.zeros(3),
+            np.zeros(3),
+            k,
+            np.asarray(distortion, dtype=np.float64).reshape(1, -1),
+        )
+        return uv.reshape(-1, 2)
+
+    normalized = pts[:, :2] / pts[:, 2:3]
+    return normalized @ k[:2, :2].T + k[:2, 2]
 
 
 def box_mask(
@@ -220,18 +208,19 @@ def box_mask(
         t4: The open ``T4Devkit``.
         frame: The :class:`CameraFrame` the box came from.
         box: A ``Box3D`` from ``frame.boxes``.
-        source: ``"ann"`` uses the annotated instance mask from ``object_ann``
-            (accurate, but only present in datasets with 2D annotations);
-            ``"hull"`` fills the convex hull of the projected 3D box corners
-            (always available, but includes background around the object);
-            ``"auto"`` prefers the annotation and falls back to the hull.
+        source: One of :data:`MASK_SOURCES`. ``"ann"`` uses the annotated
+            instance mask from ``object_ann`` (accurate, but only present in
+            datasets with 2D annotations); ``"hull"`` fills the convex hull of
+            the projected 3D box corners (always available, but includes
+            background around the object); ``"auto"`` prefers the annotation and
+            falls back to the hull.
         dilate: Grow the mask by this many pixels.
 
     Returns:
         The mask, or ``None`` if the box projects entirely behind the camera.
     """
-    if source not in ("auto", "ann", "hull"):
-        raise ValueError(f"source must be 'auto', 'ann' or 'hull', got {source!r}")
+    if source not in MASK_SOURCES:
+        raise ValueError(f"source must be one of {MASK_SOURCES}, got {source!r}")
 
     mask = None
     if source in ("auto", "ann"):
@@ -247,16 +236,18 @@ def box_mask(
 
 
 def _annotated_mask(t4, frame: CameraFrame, box) -> np.ndarray | None:
-    """Decode the ``object_ann`` RLE mask for this instance, if the dataset has one."""
-    for ann in getattr(t4, "object_ann", []):
-        if ann.sample_data_token != frame.sample_data_token:
-            continue
-        if ann.instance_token != box.uuid:
+    """Decode the ``object_ann`` RLE mask for this instance, if the dataset has one.
+
+    ``Sample.ann_2ds`` is the devkit's own reverse index, so this looks at the
+    handful of 2D annotations on this sample rather than every one in the scene.
+    """
+    sample = t4.get("sample", frame.sample_token)
+    for token in getattr(sample, "ann_2ds", []):
+        ann = t4.get("object_ann", token)
+        if ann.sample_data_token != frame.sample_data_token or ann.instance_token != box.uuid:
             continue
         decoded = np.asarray(ann.mask.decode()).astype(bool)
-        if decoded.shape != frame.image.shape[:2]:
-            return None
-        return decoded
+        return decoded if decoded.shape == frame.image.shape[:2] else None
     return None
 
 
@@ -267,36 +258,12 @@ def _hull_mask(frame: CameraFrame, box) -> np.ndarray | None:
         return None
 
     width, height = frame.size
-    try:
-        import cv2
-    except ImportError:
-        cv2 = None
-
-    if cv2 is not None:
-        hull = cv2.convexHull(uv.astype(np.float32).reshape(-1, 1, 2))
-        filled = np.zeros((height, width), dtype=np.uint8)
-        cv2.fillConvexPoly(filled, hull.astype(np.int32), 1)
-        return filled.astype(bool)
-
-    # Pure numpy fallback: the axis-aligned bounding box of the projection.
-    mask = np.zeros((height, width), dtype=bool)
-    x0, y0 = np.floor(uv.min(axis=0)).astype(int)
-    x1, y1 = np.ceil(uv.max(axis=0)).astype(int)
-    x0, y0 = max(x0, 0), max(y0, 0)
-    x1, y1 = min(x1, width), min(y1, height)
-    if x1 <= x0 or y1 <= y0:
-        return None
-    mask[y0:y1, x0:x1] = True
-    return mask
+    hull = cv2.convexHull(uv.astype(np.float32).reshape(-1, 1, 2))
+    filled = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillConvexPoly(filled, hull.astype(np.int32), 1)
+    return filled.astype(bool)
 
 
 def _dilate(mask: np.ndarray, radius: int) -> np.ndarray:
-    try:
-        import cv2
-
-        kernel = np.ones((2 * radius + 1, 2 * radius + 1), np.uint8)
-        return cv2.dilate(mask.astype(np.uint8), kernel).astype(bool)
-    except ImportError:
-        from scipy.ndimage import binary_dilation
-
-        return binary_dilation(mask, iterations=radius)
+    kernel = np.ones((2 * radius + 1, 2 * radius + 1), np.uint8)
+    return cv2.dilate(mask.astype(np.uint8), kernel).astype(bool)
