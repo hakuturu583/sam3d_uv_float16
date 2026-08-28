@@ -73,6 +73,24 @@ For  more details and multi-object reconstruction, please take a look at out two
 * [single object](notebook/demo_single_object.ipynb)
 * [multi object](notebook/demo_multi_object.ipynb)
 
+## T4 dataset
+
+`splat.ply` above is the object in SAM 3D's canonical `[-0.5, 0.5]^3` cube -- no
+metric scale, no camera alignment. To reconstruct annotated objects from a
+[T4 dataset](https://github.com/tier4/t4-devkit) and correct their scale and
+heading against the 3D boxes, so that a car faces forward at its true size:
+
+```bash
+python tools/t4_sam3d_align.py \
+    --data-root data/t4dataset/my_scene \
+    --config checkpoints/hf/pipeline.yaml \
+    --camera CAM_FRONT --category car \
+    --out-dir out/aligned
+```
+
+See [doc/t4_dataset.md](doc/t4_dataset.md) for the coordinate conventions
+involved and the alignment options.
+
 
 ## SAM 3D Body
 
