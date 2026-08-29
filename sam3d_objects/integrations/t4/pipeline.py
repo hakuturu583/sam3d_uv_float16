@@ -118,6 +118,7 @@ def reconstruct_box(
     seed: int | None = 42,
     mask_source: str = "auto",
     mask_dilate: int = 0,
+    mask_dir=None,
     out_frame: str = "box",
     viewer_axes: str | None = None,
     **align_kwargs,
@@ -132,6 +133,7 @@ def reconstruct_box(
         seed: Diffusion seed.
         mask_source: See :func:`~sam3d_objects.integrations.t4.dataset.box_mask`.
         mask_dilate: Mask dilation in pixels.
+        mask_dir: Directory of precomputed masks, for ``mask_source="file"``.
         out_frame: Export frame, one of
             :data:`~sam3d_objects.integrations.t4.frames.FRAME_CHAIN`.
         viewer_axes: Optional final axis swap for third party viewers.
@@ -141,7 +143,7 @@ def reconstruct_box(
     Returns:
         The aligned result, or ``None`` when no usable mask could be built.
     """
-    mask = box_mask(t4, frame, box, source=mask_source, dilate=mask_dilate)
+    mask = box_mask(t4, frame, box, source=mask_source, dilate=mask_dilate, mask_dir=mask_dir)
     if mask is None or not mask.any():
         return None
 

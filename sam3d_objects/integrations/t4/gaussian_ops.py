@@ -24,7 +24,12 @@ import torch
 
 from .frames import matrix_to_quat
 
-__all__ = ["opaque_positions", "transform_gaussian", "transform_splats"]
+__all__ = [
+    "kernel_safe_scaling",
+    "opaque_positions",
+    "transform_gaussian",
+    "transform_splats",
+]
 
 
 def _to_wxyz(quaternion: torch.Tensor) -> torch.Tensor:
@@ -106,6 +111,21 @@ def transform_splats(xyz, quaternion, scaling, linear, translation):
     return new_xyz, _to_wxyz(roma.rotmat_to_unitquat(u)), singular_values
 
 
+def kernel_safe_scaling(scaling: torch.Tensor, kernel: float, *, margin: float = 1e-6):
+    """Lift ``scaling`` clear of the 3D filter floor so ``from_scaling`` stays finite.
+
+    ``Gaussian.from_scaling`` inverts the filter with ``sqrt(s^2 - k^2)``. Every
+    transformed radius clears the scaled floor in exact arithmetic (see
+    :func:`transform_gaussian`), but the decoder emits most splats *at* the
+    floor -- 96% of a decoded cloud has an axis equal to ``k`` -- so in float32
+    the difference lands a hair below zero and the square root returns NaN.
+    ``save_ply`` then writes those NaNs out, silently deleting most of the cloud.
+    """
+    if kernel <= 0.0:
+        return scaling
+    return scaling.clamp_min(kernel * (1.0 + margin))
+
+
 def opaque_positions(gaussian, threshold: float = 0.9, min_count: int = 32) -> torch.Tensor:
     """Canonical positions of the opaque splats, for measuring the object size.
 
@@ -145,9 +165,12 @@ def transform_gaussian(gaussian, linear, translation):
     # object. The smallest singular value keeps the floor below every transformed
     # splat radius, which is what stops `from_scaling`'s sqrt(s^2 - k^2) going NaN.
     kernel_scale = float(np.linalg.svd(np.asarray(linear, dtype=np.float64), compute_uv=False).min())
-    gs.mininum_kernel_size = gs.mininum_kernel_size * kernel_scale
+    new_kernel = gs.mininum_kernel_size * kernel_scale
+    gs.mininum_kernel_size = new_kernel
 
     gs.from_xyz(new_xyz)
     gs.from_rotation(new_quat)
-    gs.from_scaling(new_scaling)
+    # The inequality above holds in exact arithmetic but is *tight*: the splats
+    # sitting on the floor need `kernel_safe_scaling` to survive float32.
+    gs.from_scaling(kernel_safe_scaling(new_scaling, new_kernel))
     return gs

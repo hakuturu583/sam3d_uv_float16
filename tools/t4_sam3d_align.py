@@ -63,6 +63,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="category substring to keep, repeatable (default: every box)",
     )
+    selection.add_argument(
+        "--instance-token", default=None, help="reconstruct only this instance"
+    )
     selection.add_argument("--max-distance", type=float, default=None, help="metres from camera")
     selection.add_argument("--min-area-px", type=float, default=0.0, help="min projected area")
     selection.add_argument("--min-lidar-points", type=int, default=None)
@@ -71,6 +74,12 @@ def build_parser() -> argparse.ArgumentParser:
     mask = parser.add_argument_group("mask")
     mask.add_argument("--mask-source", default="auto", choices=MASK_SOURCES)
     mask.add_argument("--mask-dilate", type=int, default=0, help="dilate the mask, in pixels")
+    mask.add_argument(
+        "--mask-dir",
+        default=None,
+        help="directory of precomputed masks for --mask-source file "
+        "(write them with tools/t4_sam3_masks.py)",
+    )
 
     align = parser.add_argument_group("alignment")
     align.add_argument(
@@ -109,6 +118,20 @@ def build_parser() -> argparse.ArgumentParser:
     model.add_argument("--seed", type=int, default=42)
     model.add_argument("--compile", action="store_true")
 
+    densify = parser.add_argument_group("densification")
+    densify.add_argument(
+        "--densify-passes",
+        type=int,
+        default=0,
+        help="fill the decoder's lattice holes with interpolated splats (0 = off)",
+    )
+    densify.add_argument(
+        "--densify-coverage",
+        type=float,
+        default=2.0,
+        help="fill a neighbour pair when it is longer than this many summed radii",
+    )
+
     parser.add_argument("--out-dir", default="out/t4_aligned")
     parser.add_argument(
         "--dry-run",
@@ -138,6 +161,8 @@ def main(argv: list[str] | None = None) -> int:
         max_distance=args.max_distance,
         min_lidar_points=args.min_lidar_points,
     )
+    if args.instance_token is not None:
+        boxes = [b for b in boxes if b.uuid == args.instance_token]
     if args.limit is not None:
         boxes = boxes[: args.limit]
 
@@ -167,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
             seed=args.seed,
             mask_source=args.mask_source,
             mask_dilate=args.mask_dilate,
+            mask_dir=args.mask_dir,
             out_frame=args.out_frame,
             viewer_axes=args.viewer_axes,
             rotation_mode=args.rotation_mode,
@@ -179,6 +205,17 @@ def main(argv: list[str] | None = None) -> int:
         if result is None:
             print("  skipped: no usable mask")
             continue
+
+        if args.densify_passes > 0:
+            from sam3d_objects.integrations.t4.densify import densify_gaussian
+
+            before = len(result.gaussian.get_xyz)
+            result.gaussian = densify_gaussian(
+                result.gaussian,
+                passes=args.densify_passes,
+                coverage=args.densify_coverage,
+            )
+            print(f"  densified {before} -> {len(result.gaussian.get_xyz)} splats")
 
         result.save_ply(out_dir / f"{stem}.ply")
         result.save_report(out_dir / f"{stem}.json")
