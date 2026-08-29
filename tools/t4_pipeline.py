@@ -110,6 +110,13 @@ def build_parser() -> argparse.ArgumentParser:
     selection.add_argument(
         "--max-train-views", type=int, default=None, help="cap the views the lidar fit uses"
     )
+    selection.add_argument(
+        "--shortlist",
+        type=int,
+        default=5,
+        help="frames per instance whose focus is measured before the final pick; "
+        "0 ranks on geometry alone and never decodes an image",
+    )
 
     run = parser.add_argument_group("execution")
     run.add_argument(
@@ -157,8 +164,9 @@ def stage_scan(args, work: Path) -> list[Target]:
     )
     print(f"{len(views)} clean views of {len({v.instance_token for v in views})} instances")
 
+    print("measuring focus on each instance's best few frames...", flush=True)
     targets = []
-    for rank, best in enumerate(best_per_instance(views)):
+    for best in best_per_instance(views, t4=t4, shortlist=args.shortlist):
         if best.area_px < args.min_area_px:
             continue
         train = [v for v in views if v.instance_token == best.instance_token]
@@ -179,9 +187,11 @@ def stage_scan(args, work: Path) -> list[Target]:
     payload = [target.to_dict() for target in targets]
     (work / "targets.json").write_text(json.dumps(payload, indent=2))
     for target in targets:
+        best = target.best_view
         print(
-            f"  {target.name}: {target.category} at {target.best_view.distance_m:.1f} m in "
-            f"{target.best_view.camera} (sample {target.best_view.sample_index}), "
+            f"  {target.name}: {target.category} at {best.distance_m:.1f} m in {best.camera} "
+            f"(sample {best.sample_index}), aspect {best.aspect_deg:.0f} deg, "
+            f"{best.area_px / 1e3:.0f}k px, {best.num_lidar_pts} lidar pts, "
             f"{len(target.train_views)} training view(s)"
         )
     print(f"wrote {work / 'targets.json'}")
@@ -198,11 +208,20 @@ def stage_masks(args, work: Path, targets: list[Target]) -> None:
     for target in targets:
         views = work / "views" / f"{target.name}.json"
         views.parent.mkdir(parents=True, exist_ok=True)
+        # The reconstruction frame goes first and always: --max-train-views can
+        # otherwise cut it, and the build stage then has no mask to work from.
+        ordered = [target.best_view] + [
+            v for v in target.train_views if v.sample_token != target.best_view.sample_token
+        ]
         views.write_text(
             json.dumps(
                 [
-                    {"sample_index": v.sample_index, "sample_token": v.sample_token, "camera": v.camera}
-                    for v in target.train_views
+                    {
+                        "sample_index": v.sample_index,
+                        "sample_token": v.sample_token,
+                        "camera": v.camera,
+                    }
+                    for v in ordered
                 ],
                 indent=1,
             )
@@ -239,6 +258,14 @@ def stage_build(args, work: Path, targets: list[Target]) -> None:
             ],
             f"reconstruction of {target.name}",
         )
+        # The aligner reports a skipped object on its own exit code 0, so a
+        # missing ply here is a failure the later stages must not inherit.
+        directory = work / "assets" / target.name
+        if not any(directory.glob("*.ply")):
+            raise SystemExit(
+                f"{target.name}: the reconstruction wrote no ply into {directory}. "
+                "The usual cause is a missing mask for the best view."
+            )
 
 
 def stage_lidar(args, work: Path, targets: list[Target]) -> None:

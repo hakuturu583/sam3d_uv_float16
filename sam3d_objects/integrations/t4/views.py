@@ -31,6 +31,8 @@ __all__ = [
     "fully_inside",
     "projected_corners",
     "scan_views",
+    "sharpness",
+    "view_score",
 ]
 
 #: Cameras worth searching for a clean view of an object.
@@ -60,6 +62,9 @@ class ObjectView:
     area_px: float
     distance_m: float
     num_lidar_pts: int
+    #: Angle between the line of sight and the object's forward axis, 0-90 deg.
+    #: 0 is nose- or tail-on, 90 is broadside, 45 is the three-quarter view.
+    aspect_deg: float = 45.0
 
     def to_dict(self) -> dict:
         return {
@@ -71,11 +76,18 @@ class ObjectView:
             "area_px": self.area_px,
             "distance_m": self.distance_m,
             "num_lidar_pts": self.num_lidar_pts,
+            "aspect_deg": self.aspect_deg,
         }
 
     @classmethod
     def from_dict(cls, payload: dict) -> "ObjectView":
-        return cls(**{field: payload[field] for field in cls.__dataclass_fields__})
+        return cls(
+            **{
+                field: payload[field]
+                for field in cls.__dataclass_fields__
+                if field in payload
+            }
+        )
 
 
 def projected_corners(frame, box) -> np.ndarray | None:
@@ -173,6 +185,7 @@ def scan_views(
                     continue
 
                 view = ObjectView(
+                    aspect_deg=_aspect_angle(box),
                     sample_index=sample_index,
                     sample_token=frame.sample_token,
                     camera=camera,
@@ -197,15 +210,116 @@ def scan_views(
     return sorted(views, key=lambda v: (v.sample_index, v.camera))
 
 
-def best_per_instance(views: Sequence[ObjectView]) -> list[ObjectView]:
-    """The single best view of each instance -- the one that sees it largest.
+def _aspect_angle(box) -> float:
+    """Angle between the line of sight and the object's forward axis, in degrees.
 
-    This is what a reconstruction wants: one frame, as much of the object in it
-    as the sequence ever offers.
+    Measured in the horizontal plane and folded into 0-90: a vehicle looks the
+    same to this whether it is coming or going.
     """
-    best: dict[str, ObjectView] = {}
+    forward = np.asarray(box.rotation.rotation_matrix, float)[:, 0]
+    towards = np.asarray(box.position, float)
+    # The camera frame is OpenCV: +X right, +Y down, +Z forward, so the ground
+    # plane is XZ and "down" is the axis to drop.
+    a = np.array([forward[0], forward[2]])
+    b = np.array([towards[0], towards[2]])
+    if np.linalg.norm(a) < 1e-9 or np.linalg.norm(b) < 1e-9:
+        return 45.0
+    cosine = abs(float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))))
+    return float(np.degrees(np.arccos(np.clip(cosine, 0.0, 1.0))))
+
+
+def view_score(
+    view: ObjectView,
+    *,
+    reference_area: float,
+    aspect_weight: float = 0.35,
+    lidar_weight: float = 0.15,
+) -> float:
+    """How promising a frame is as the single input to a reconstruction.
+
+    Three things decide it, and size alone is none of them:
+
+    * **size** -- pixels on the object, relative to the best frame of that
+      instance. Taken as a square root, because the difference between 20% and
+      40% of the best matters far more than between 80% and 100%.
+    * **aspect** -- a three-quarter view shows two faces at once, which is what
+      pins an object's length *and* width. Nose-on shows one, and SAM 3D has to
+      guess the rest of the vehicle.
+    * **lidar support** -- returns on the object are what the geometry refit and
+      the reflectance fit are later built from.
+
+    Returns a number in roughly 0-1; only the ordering is meaningful.
+    """
+    size = np.sqrt(np.clip(view.area_px / max(reference_area, 1.0), 0.0, 1.0))
+    # Peaks at 45 deg, and never falls to zero: a broadside view is worse than a
+    # three-quarter one, not useless.
+    aspect = 0.5 + 0.5 * float(np.sin(np.radians(2 * view.aspect_deg)))
+    lidar = np.log1p(view.num_lidar_pts) / np.log1p(5000.0)
+    base = 1.0 - aspect_weight - lidar_weight
+    return float(base * size + aspect_weight * aspect + lidar_weight * min(lidar, 1.0))
+
+
+def sharpness(t4, view: ObjectView) -> float:
+    """Focus of the object's own pixels, as the variance of their Laplacian.
+
+    A frame can be large, well angled and well covered by lidar and still be a
+    poor reconstruction input because the vehicle was moving across it. This is
+    the one term that needs the image decoded, so it is measured on a shortlist
+    rather than on every frame of the scan.
+    """
+    import cv2
+
+    from .dataset import load_camera_frame
+
+    frame = load_camera_frame(t4, sample_token=view.sample_token, channel=view.camera)
+    box = next((b for b in frame.boxes if b.uuid == view.instance_token), None)
+    if box is None:
+        return 0.0
+    uv = projected_corners(frame, box)
+    if uv is None:
+        return 0.0
+    width, height = frame.size
+    x0, x1 = np.clip([uv[:, 0].min(), uv[:, 0].max()], 0, width - 1).astype(int)
+    y0, y1 = np.clip([uv[:, 1].min(), uv[:, 1].max()], 0, height - 1).astype(int)
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return 0.0
+    crop = cv2.cvtColor(frame.image[y0:y1, x0:x1], cv2.COLOR_RGB2GRAY)
+    return float(cv2.Laplacian(crop, cv2.CV_64F).var())
+
+
+def best_per_instance(
+    views: Sequence[ObjectView],
+    *,
+    t4=None,
+    shortlist: int = 5,
+    sharpness_weight: float = 0.3,
+) -> list[ObjectView]:
+    """The frame to reconstruct each instance from, best first.
+
+    Ranked by :func:`view_score`, then -- when ``t4`` is given -- the top
+    ``shortlist`` frames of each instance have their focus measured and the
+    ranking is redone. Decoding five images per object is affordable; decoding
+    every frame of the scan is not.
+    """
+    by_instance: dict[str, list[ObjectView]] = {}
     for view in views:
-        current = best.get(view.instance_token)
-        if current is None or view.area_px > current.area_px:
-            best[view.instance_token] = view
-    return sorted(best.values(), key=lambda v: -v.area_px)
+        by_instance.setdefault(view.instance_token, []).append(view)
+
+    chosen = []
+    for candidates in by_instance.values():
+        reference = max(v.area_px for v in candidates)
+        ranked = sorted(
+            candidates, key=lambda v: -view_score(v, reference_area=reference)
+        )
+        best = ranked[0]
+        if t4 is not None and shortlist > 1:
+            top = ranked[:shortlist]
+            focus = [sharpness(t4, v) for v in top]
+            sharpest = max(focus) or 1.0
+            best = max(
+                zip(top, focus),
+                key=lambda pair: view_score(pair[0], reference_area=reference)
+                + sharpness_weight * (pair[1] / sharpest),
+            )[0]
+        chosen.append((best, view_score(best, reference_area=reference)))
+    return [view for view, _ in sorted(chosen, key=lambda pair: -pair[1])]

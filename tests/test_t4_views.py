@@ -107,3 +107,70 @@ def test_best_per_instance_takes_the_largest_view_of_each():
 def test_object_view_round_trips_through_json():
     original = view("token", 123.0, sample=7, camera="CAM_BACK")
     assert ObjectView.from_dict(original.to_dict()) == original
+
+
+def scored(area=1e6, aspect=45.0, lidar=1000, instance="a", sample=0):
+    return ObjectView(
+        sample_index=sample,
+        sample_token=f"s{sample}",
+        camera="CAM_FRONT",
+        instance_token=instance,
+        category="car",
+        area_px=area,
+        distance_m=10.0,
+        num_lidar_pts=lidar,
+        aspect_deg=aspect,
+    )
+
+
+def test_a_three_quarter_view_beats_a_nose_on_one_of_the_same_size():
+    """Two faces pin length and width; one face leaves the rest to be guessed."""
+    from sam3d_objects.integrations.t4.views import view_score
+
+    reference = 1e6
+    quarter = view_score(scored(aspect=45.0), reference_area=reference)
+    nose_on = view_score(scored(aspect=2.0), reference_area=reference)
+    broadside = view_score(scored(aspect=88.0), reference_area=reference)
+    assert quarter > broadside > 0
+    assert quarter > nose_on > 0
+
+
+def test_size_still_dominates_a_marginally_better_angle():
+    from sam3d_objects.integrations.t4.views import view_score
+
+    reference = 1e6
+    big = view_score(scored(area=1e6, aspect=20.0), reference_area=reference)
+    tiny = view_score(scored(area=2e4, aspect=45.0), reference_area=reference)
+    assert big > tiny
+
+
+def test_lidar_support_breaks_a_tie():
+    from sam3d_objects.integrations.t4.views import view_score
+
+    reference = 1e6
+    rich = view_score(scored(lidar=4000), reference_area=reference)
+    poor = view_score(scored(lidar=5), reference_area=reference)
+    assert rich > poor
+
+
+def test_best_per_instance_ranks_by_score_not_area():
+    """The largest frame is not automatically the one to reconstruct from."""
+    from sam3d_objects.integrations.t4.views import best_per_instance
+
+    views = [
+        scored(area=1.0e6, aspect=1.0, lidar=50, sample=1),   # biggest, nose-on
+        scored(area=0.9e6, aspect=45.0, lidar=3000, sample=2),  # slightly smaller, better
+    ]
+    assert best_per_instance(views)[0].sample_index == 2
+
+
+def test_aspect_survives_the_json_round_trip():
+    original = scored(aspect=33.0)
+    assert ObjectView.from_dict(original.to_dict()).aspect_deg == pytest.approx(33.0)
+
+
+def test_an_old_targets_file_without_aspect_still_loads():
+    """Files written before the score existed must not break the pipeline."""
+    payload = scored().to_dict()
+    payload.pop("aspect_deg")
+    assert ObjectView.from_dict(payload).aspect_deg == pytest.approx(45.0)
