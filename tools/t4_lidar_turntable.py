@@ -14,9 +14,13 @@ lidar range -- so the two modalities can be checked against each other.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
+# Set before anything imports the package: `sam3d_objects.__init__` pulls in an
+# internal init module that is not part of the public release.
+os.environ.setdefault("LIDRA_SKIP_INIT", "true")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
@@ -106,6 +110,34 @@ def load_asset(path, device):
         lidar_opacity=to_device(lidar_opacity),
         has_lidar=splats.has_lidar,
     )
+
+
+def look_at(eye, target, up=(0.0, 0.0, 1.0)):
+    """World->sensor, OpenCV convention (+X right, +Y down, +Z forward)."""
+    eye, target = np.asarray(eye, float), np.asarray(target, float)
+    forward = target - eye
+    forward /= np.linalg.norm(forward)
+    right = np.cross(forward, np.asarray(up, float))
+    right /= np.linalg.norm(right)
+    upward = np.cross(right, forward)
+    matrix = np.eye(4, dtype=np.float32)
+    matrix[:3, :3] = np.stack([right, -upward, forward])
+    matrix[:3, 3] = -matrix[:3, :3] @ eye
+    return matrix
+
+
+def sensor_frame(eye, target):
+    """World->sensor for a lidar: +X forward, +Y left, +Z up, as a spinner sees it."""
+    eye, target = np.asarray(eye, float), np.asarray(target, float)
+    forward = target - eye
+    forward /= np.linalg.norm(forward)
+    left = np.cross([0.0, 0.0, 1.0], forward)
+    left /= np.linalg.norm(left)
+    up = np.cross(forward, left)
+    matrix = np.eye(4, dtype=np.float32)
+    matrix[:3, :3] = np.stack([forward, left, up])
+    matrix[:3, 3] = -matrix[:3, :3] @ eye
+    return matrix
 
 
 def _font(size):
@@ -283,6 +315,7 @@ def main(argv=None) -> int:
     sheet_width = args.width * 3 + 40
     sheet_width += sheet_width % 2
 
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     writer = imageio.get_writer(args.out, fps=args.fps, macro_block_size=1)
     for index in range(args.frames):
         angle = 2 * np.pi * index / args.frames

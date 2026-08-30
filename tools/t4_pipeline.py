@@ -234,8 +234,53 @@ def stage_masks(args, work: Path, targets: list[Target]) -> None:
                 "--views-json", views,
                 "--instance-token", target.instance_token,
                 "--out-dir", work / "masks" / target.name,
+                "--skip-existing",
             ],
             f"masks for {target.name}",
+        )
+
+    _repoint_at_segmented_frames(work, targets)
+
+
+def _repoint_at_segmented_frames(work: Path, targets: list[Target]) -> None:
+    """Move each target onto its best frame that SAM 3 could actually segment.
+
+    SAM 3 refuses a mask it does not believe in, and on a dark vehicle it
+    refuses plenty. When that happens to be the frame the scan chose, the build
+    stage has nothing to reconstruct from -- so the choice is remade over the
+    frames that do have a mask, in the same order the scan ranked them.
+    """
+    changed = False
+    for target in targets:
+        report = work / "masks" / target.name / "masks.json"
+        if not report.exists():
+            continue
+        segmented = {
+            (entry["sample_token"], entry["camera"])
+            for entry in json.loads(report.read_text())
+            if entry.get("instance_token") == target.instance_token
+        }
+        if (target.best_view.sample_token, target.best_view.camera) in segmented:
+            continue
+        replacement = next(
+            (v for v in target.train_views if (v.sample_token, v.camera) in segmented), None
+        )
+        if replacement is None:
+            raise SystemExit(
+                f"{target.name}: SAM 3 produced no mask for any of its "
+                f"{len(target.train_views)} views; nothing can be reconstructed"
+            )
+        print(
+            f"  {target.name}: no mask for the chosen frame (sample "
+            f"{target.best_view.sample_index}); reconstructing from sample "
+            f"{replacement.sample_index} instead"
+        )
+        target.best_view = replacement
+        changed = True
+
+    if changed:
+        (work / "targets.json").write_text(
+            json.dumps([t.to_dict() for t in targets], indent=2)
         )
 
 

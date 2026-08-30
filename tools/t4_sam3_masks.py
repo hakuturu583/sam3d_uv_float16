@@ -113,6 +113,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--preview", action="store_true", help="also write a cut-out RGBA preview per mask"
     )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="leave masks that are already on disk alone. Segmenting a few hundred "
+        "views takes minutes; an interrupted run should not pay for them twice.",
+    )
     return parser
 
 
@@ -198,6 +204,30 @@ def segment_frame(t4, frame, args, model, processor, out_dir) -> list:
     )
     if args.instance_token is not None:
         boxes = [b for b in boxes if b.uuid == args.instance_token]
+    cached = []
+    if args.skip_existing:
+        fresh = []
+        for box in boxes:
+            stem = mask_key(frame, box)
+            if (out_dir / f"{stem}.png").exists():
+                # Still reported, or an interrupted run would leave masks.json
+                # claiming the object was never segmented.
+                cached.append(
+                    dict(
+                        stem=stem,
+                        category=box.semantic_label.name,
+                        sample_token=frame.sample_token,
+                        sample_data_token=frame.sample_data_token,
+                        camera=frame.channel,
+                        instance_token=box.uuid,
+                        cached=True,
+                    )
+                )
+            else:
+                fresh.append(box)
+        boxes = fresh
+        if not boxes:
+            return cached
 
     width, height = frame.size
     if args.fully_visible:
@@ -215,7 +245,7 @@ def segment_frame(t4, frame, args, model, processor, out_dir) -> list:
 
     print(f"{frame.channel}: {width}x{height}, {len(boxes)} object(s)")
     if not boxes:
-        return []
+        return cached
 
     # The image is encoded once; every box below is decoded against that state.
     # `set_image` reads the size off `shape[-2:]`, so hand it a PIL image rather
@@ -293,7 +323,7 @@ def segment_frame(t4, frame, args, model, processor, out_dir) -> list:
                 out_dir / f"{stem}_preview.png"
             )
 
-    return report
+    return cached + report
 
 
 if __name__ == "__main__":
