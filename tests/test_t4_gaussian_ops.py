@@ -19,6 +19,7 @@ from sam3d_objects.integrations.t4.frames import VIEWER_AXES, quat_to_matrix, ro
 from sam3d_objects.integrations.t4.gaussian_ops import (
     _quaternion_multiply,
     _similarity_scale,
+    kernel_safe_scaling,
     transform_splats,
 )
 
@@ -110,3 +111,50 @@ def test_transformed_scales_stay_above_the_scaled_kernel_floor(seed):
     _, _, new_scaling = transform_splats(torch.zeros(128, 3), quat, scaling, linear, torch.zeros(3))
     new_kernel = float(torch.linalg.svdvals(linear).min()) * kernel
     assert float(new_scaling.min()) >= new_kernel - 1e-6
+
+
+def softplus_inverse(x):
+    """`gaussian_model.softplus_inverse_scaling_activation`, inlined to stay CPU-only.
+
+    Undefined at zero (`log(0)`) and NaN below it -- which is the whole point here.
+    """
+    return x + torch.log(-torch.expm1(-x))
+
+
+def test_floor_splats_survive_the_transform_in_float32():
+    """The decoder puts most splats *on* the 3D filter floor; they must survive.
+
+    `get_scaling` reads `sqrt(softplus(...)^2 + k^2)`, and for a floor splat the
+    softplus term is far below float32 resolution next to `k`, so the radius comes
+    back as exactly `k`. `from_scaling` then inverts with `sqrt(s^2 - k^2)` on a
+    radicand that has rounded to zero (or below), and `softplus_inverse` turns
+    that into -inf/NaN -- the failure that emptied 93% of an exported T4 cloud.
+    """
+    kernel = 0.0009  # 3d_filter_kernel_size, from the released decoder config
+    n = 512
+    _, quat, _ = random_splats(n)
+    scaling = torch.full((n, 3), kernel)  # what `get_scaling` returns on the floor
+
+    # The real box refit: a similarity that mirrors X and Y (camera -> box frame).
+    linear = torch.tensor(np.diag([-1.0, -1.0, 1.0]) * 9.476282, dtype=torch.float32)
+    _, _, new_scaling = transform_splats(torch.zeros(n, 3), quat, scaling, linear, torch.zeros(3))
+    # `transform_gaussian` rescales the kernel in float64, as numpy's SVD returns it.
+    new_kernel = float(np.linalg.svd(linear.numpy().astype(np.float64), compute_uv=False).min()) * kernel
+
+    from_scaling = lambda s: softplus_inverse(torch.sqrt(torch.square(s) - new_kernel**2))
+    assert not torch.isfinite(from_scaling(new_scaling)).all(), (
+        "test no longer reproduces the float32 collapse at the kernel floor"
+    )
+
+    guarded = from_scaling(kernel_safe_scaling(new_scaling, new_kernel))
+    assert torch.isfinite(guarded).all()
+    # The guard must not inflate the splats: the filtered radius still reads back
+    # as the scaled floor.
+    radius = torch.sqrt(torch.nn.functional.softplus(guarded) ** 2 + new_kernel**2)
+    assert torch.allclose(radius, new_scaling, rtol=1e-4)
+
+
+def test_kernel_safe_scaling_leaves_ordinary_splats_alone():
+    _, _, scaling = random_splats(64)
+    assert torch.equal(kernel_safe_scaling(scaling, 0.0), scaling)
+    assert torch.equal(kernel_safe_scaling(scaling, float(scaling.min()) * 0.5), scaling)

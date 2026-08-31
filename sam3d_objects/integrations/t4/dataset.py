@@ -17,7 +17,9 @@ from PIL import Image
 __all__ = [
     "MASK_SOURCES",
     "CameraFrame",
+    "CameraGeometry",
     "box_mask",
+    "mask_key",
     "load_t4",
     "load_camera_frame",
     "project_points",
@@ -25,7 +27,7 @@ __all__ = [
 ]
 
 #: Where :func:`box_mask` may take an object's mask from.
-MASK_SOURCES = ("auto", "ann", "hull")
+MASK_SOURCES = ("auto", "ann", "hull", "file")
 
 
 def load_t4(data_root, revision: str | None = None, verbose: bool = True):
@@ -67,6 +69,67 @@ class CameraFrame:
     def size(self) -> tuple[int, int]:
         """``(width, height)`` in pixels."""
         return self.image.shape[1], self.image.shape[0]
+
+
+@dataclass
+class CameraGeometry:
+    """What a camera saw, minus the pixels.
+
+    Scanning a whole scene for well-framed objects needs the boxes and the
+    projection, not the image; decoding every frame's JPEG to throw it away costs
+    more than the rest of the search put together.
+    """
+
+    sample_token: str
+    sample_data_token: str
+    channel: str
+    size: tuple[int, int]
+    intrinsic: np.ndarray
+    distortion: np.ndarray | None
+    boxes: list[Any]
+
+
+def load_camera_geometry(
+    t4,
+    *,
+    sample_token: str | None = None,
+    sample_index: int = 0,
+    channel: str = "CAM_FRONT",
+    visibility: str | None = None,
+) -> CameraGeometry:
+    """Boxes and projection for one camera frame, without reading the image.
+
+    Same selection arguments as :func:`load_camera_frame`.
+    """
+    from t4_devkit.schema import VisibilityLevel
+
+    sample = t4.get("sample", sample_token) if sample_token else t4.sample[sample_index]
+    if channel not in sample.data:
+        raise KeyError(f"channel {channel!r} not in sample; available: {sorted(sample.data)}")
+    sd_token = sample.data[channel]
+
+    level = VisibilityLevel.NONE if visibility is None else VisibilityLevel(visibility)
+    _, boxes, intrinsic = t4.get_sample_data(
+        sd_token, as_3d=True, as_sensor_coord=True, visibility=level
+    )
+    if intrinsic is None:
+        raise ValueError(f"{channel!r} is not a camera channel")
+
+    sd_record = t4.get("sample_data", sd_token)
+    cs_record = t4.get("calibrated_sensor", sd_record.calibrated_sensor_token)
+    distortion = np.asarray(cs_record.camera_distortion, dtype=np.float64).reshape(-1)
+    if distortion.size == 0 or not np.any(distortion):
+        distortion = None
+
+    return CameraGeometry(
+        sample_token=sample.token,
+        sample_data_token=sd_token,
+        channel=channel,
+        size=(int(sd_record.width), int(sd_record.height)),
+        intrinsic=np.asarray(intrinsic, dtype=np.float64).reshape(3, 3),
+        distortion=distortion,
+        boxes=list(boxes),
+    )
 
 
 def load_camera_frame(
@@ -194,6 +257,16 @@ def project_points(points, intrinsic, distortion=None) -> np.ndarray | None:
     return normalized @ k[:2, :2].T + k[:2, 2]
 
 
+def mask_key(frame: CameraFrame, box) -> str:
+    """Stem identifying one object in one image, for masks kept on disk.
+
+    The image token pins the camera and the timestamp, the instance token pins
+    the object, so the pair is unique across a whole dataset. Generator and
+    reader share this one definition; nothing else may spell the name out.
+    """
+    return f"{frame.sample_data_token}__{box.uuid}"
+
+
 def box_mask(
     t4,
     frame: CameraFrame,
@@ -201,6 +274,7 @@ def box_mask(
     *,
     source: str = "auto",
     dilate: int = 0,
+    mask_dir=None,
 ) -> np.ndarray | None:
     """Return a ``(H, W)`` boolean mask for one box, to feed SAM 3D.
 
@@ -213,14 +287,23 @@ def box_mask(
             datasets with 2D annotations); ``"hull"`` fills the convex hull of
             the projected 3D box corners (always available, but includes
             background around the object); ``"auto"`` prefers the annotation and
-            falls back to the hull.
+            falls back to the hull; ``"file"`` reads a mask precomputed into
+            ``mask_dir`` -- see ``tools/t4_sam3_masks.py``, which segments the
+            object with SAM 3 instead of settling for the box hull.
         dilate: Grow the mask by this many pixels.
+        mask_dir: Directory of ``<mask_key>.png`` masks, required by ``"file"``.
 
     Returns:
         The mask, or ``None`` if the box projects entirely behind the camera.
     """
     if source not in MASK_SOURCES:
         raise ValueError(f"source must be one of {MASK_SOURCES}, got {source!r}")
+
+    if source == "file":
+        if mask_dir is None:
+            raise ValueError('mask_dir is required for source="file"')
+        mask = _file_mask(mask_dir, frame, box)
+        return None if mask is None else (_dilate(mask, dilate) if dilate > 0 else mask)
 
     mask = None
     if source in ("auto", "ann"):
@@ -249,6 +332,17 @@ def _annotated_mask(t4, frame: CameraFrame, box) -> np.ndarray | None:
         decoded = np.asarray(ann.mask.decode()).astype(bool)
         return decoded if decoded.shape == frame.image.shape[:2] else None
     return None
+
+
+def _file_mask(mask_dir, frame: CameraFrame, box) -> np.ndarray | None:
+    """Read this object's precomputed mask, or ``None`` when it was not written."""
+    from pathlib import Path
+
+    path = Path(mask_dir) / f"{mask_key(frame, box)}.png"
+    if not path.exists():
+        return None
+    decoded = np.asarray(Image.open(path).convert("L")) > 127
+    return decoded if decoded.shape == frame.image.shape[:2] else None
 
 
 def _hull_mask(frame: CameraFrame, box) -> np.ndarray | None:
